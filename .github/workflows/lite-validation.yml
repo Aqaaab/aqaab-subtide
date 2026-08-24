@@ -1,0 +1,55 @@
+name: Lite Validation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'backend/**'
+      - 'extension/**'
+      - '.github/workflows/lite-validation.yml'
+  pull_request:
+    paths:
+      - 'backend/**'
+      - 'extension/**'
+      - '.github/workflows/lite-validation.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lite-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Syntax check
+        run: python -m compileall -q backend
+      - name: Run lightweight tests
+        env:
+          WHISPER_MODEL: tiny
+          WHISPER_CPU_THREADS: '2'
+          WHISPER_BEAM_SIZE: '1'
+          ENABLE_DIARIZATION: 'false'
+          ENABLE_VAD: 'false'
+        run: |
+          python -m pip install -q pytest
+          PYTHONPATH=. pytest -q backend/tests/test_lite_profile.py
+
+  lite-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: JavaScript syntax check
+        shell: bash
+        run: |
+          find extension/src -name '*.js' -print0 | while IFS= read -r -d '' f; do
+            node --check "$f"
+          done
+      - name: Validate manifest JSON
+        run: python -m json.tool extension/manifest.json >/dev/null
