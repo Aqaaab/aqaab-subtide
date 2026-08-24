@@ -1,0 +1,40 @@
+name: Build Lite Package
+
+on:
+  push:
+    tags:
+      - 'lite-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package-lite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare Lite package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/aqaab-subtide-lite/backend dist/aqaab-subtide-lite/extension
+          cp backend/run-lite.sh dist/aqaab-subtide-lite/backend/
+          cp backend/run-lite.cmd dist/aqaab-subtide-lite/backend/
+          cp backend/requirements-lite.txt dist/aqaab-subtide-lite/backend/
+          cp backend/.env.lite.example dist/aqaab-subtide-lite/backend/
+          cp -r backend/routes dist/aqaab-subtide-lite/backend/
+          cp -r backend/services dist/aqaab-subtide-lite/backend
+          cp -r backend/utils dist/aqaab-subtide-lite/backend
+          cp backend/app.py backend/config.py backend/preload_models.py dist/aqaab-subtide-lite/backend/
+          cp -r extension dist/aqaab-subtide-lite/
+          cp README.md LICENSE LITE_SETUP.md dist/aqaab-subtide-lite/
+          cd dist
+          zip -r ../aqaab-subtide-lite.zip aqaab-subtide-lite
+
+      - name: Upload Lite artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aqaab-subtide-lite
+          path: aqaab-subtide-lite.zip
