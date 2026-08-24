@@ -23,7 +23,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 
-/** In-app YouTube mode. No SYSTEM_ALERT_WINDOW permission is required. */
+/** In-app YouTube mode. Translation is serialized so captions never pile up. */
 class YouTubePlayerActivity : Activity() {
     private lateinit var webView: WebView
     private lateinit var subtitle: TextView
@@ -33,6 +33,8 @@ class YouTubePlayerActivity : Activity() {
     private val translator = LocalTranslator()
     private var lastCaption = ""
     private var lastCaptionAt = 0L
+    private var pendingCaption: String? = null
+    private var translating = false
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -43,17 +45,14 @@ class YouTubePlayerActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.BLACK)
         }
-
-        val header = TextView(this).apply {
+        root.addView(TextView(this).apply {
             text = "Aqaab Subtide — ترجمة YouTube"
             textSize = 19f
             setTextColor(Color.WHITE)
             setPadding(16, 14, 16, 6)
-        }
-        root.addView(header)
-
+        })
         status = TextView(this).apply {
-            text = "ألصق رابط YouTube ثم اضغط تشغيل"
+            text = "جاري تجهيز الترجمة الهندية → العربية…"
             textSize = 14f
             setTextColor(Color.LTGRAY)
             setPadding(16, 0, 16, 8)
@@ -64,7 +63,6 @@ class YouTubePlayerActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(10, 6, 10, 8)
         }
-
         urlInput = EditText(this).apply {
             hint = "رابط فيديو YouTube"
             setSingleLine(true)
@@ -73,18 +71,14 @@ class YouTubePlayerActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         controls.addView(urlInput)
-
-        val paste = Button(this).apply {
+        controls.addView(Button(this).apply {
             text = "لصق"
             setOnClickListener { pasteUrl() }
-        }
-        controls.addView(paste)
-
-        val open = Button(this).apply {
+        })
+        controls.addView(Button(this).apply {
             text = "تشغيل"
             setOnClickListener { loadYouTube(urlInput.text.toString()) }
-        }
-        controls.addView(open)
+        })
         root.addView(controls)
 
         webView = WebView(this).apply {
@@ -119,6 +113,13 @@ class YouTubePlayerActivity : Activity() {
         root.addView(subtitle)
         setContentView(root)
 
+        // Preload the Hindi model so the first subtitle does not pay the model-download cost.
+        translator.prepare(
+            "hi",
+            { runOnUiThread { status.text = "جاهز — الصق رابط YouTube ثم اضغط تشغيل" } },
+            { runOnUiThread { status.text = "جاهز — سيتم تنزيل نموذج الهندية عند الحاجة" } }
+        )
+
         val initialUrl = intent.getStringExtra("url").orEmpty()
         if (initialUrl.isNotBlank()) {
             urlInput.setText(initialUrl)
@@ -139,14 +140,14 @@ class YouTubePlayerActivity : Activity() {
     }
 
     private fun loadYouTube(raw: String) {
-        val value = raw.trim()
-        val normalized = normalizeYouTubeUrl(value)
+        val normalized = normalizeYouTubeUrl(raw.trim())
         if (normalized == null) {
             status.text = "الرابط غير صالح. استخدم رابط YouTube كاملًا أو youtu.be"
             return
         }
         lastCaption = ""
         lastCaptionAt = 0L
+        pendingCaption = null
         subtitle.text = "الترجمة العربية تظهر هنا"
         status.text = "جاري فتح الفيديو…"
         webView.loadUrl(normalized)
@@ -158,9 +159,8 @@ class YouTubePlayerActivity : Activity() {
         val uri = runCatching { Uri.parse(value) }.getOrNull() ?: return null
         val host = uri.host?.lowercase().orEmpty()
         return when {
-            host == "youtu.be" -> {
-                val id = uri.path.orEmpty().trim('/')
-                if (id.isBlank()) null else "https://www.youtube.com/watch?v=$id"
+            host == "youtu.be" -> uri.path.orEmpty().trim('/').takeIf { it.isNotBlank() }?.let {
+                "https://www.youtube.com/watch?v=$it"
             }
             host == "youtube.com" || host.endsWith(".youtube.com") -> value
             else -> null
@@ -173,7 +173,7 @@ class YouTubePlayerActivity : Activity() {
             override fun run() {
                 if (isFinishing || (android.os.Build.VERSION.SDK_INT >= 17 && isDestroyed)) return
                 injectCaptionScript()
-                handler.postDelayed(this, 700)
+                handler.postDelayed(this, 600)
             }
         })
     }
@@ -182,36 +182,55 @@ class YouTubePlayerActivity : Activity() {
         webView.evaluateJavascript(CAPTION_SCRIPT, null)
     }
 
+    private fun enqueueCaption(clean: String) {
+        pendingCaption = clean // Keep only the newest caption; do not build latency behind the video.
+        if (!translating) processNextCaption()
+    }
+
+    private fun processNextCaption() {
+        val text = pendingCaption ?: return
+        pendingCaption = null
+        translating = true
+        val hint = if (HINDI_REGEX.containsMatchIn(text)) "hi" else null
+        translator.translateToArabic(
+            text,
+            hint,
+            { arabic ->
+                runOnUiThread {
+                    subtitle.text = arabic.ifBlank { text }
+                    status.text = "الترجمة تعمل"
+                }
+                translating = false
+                processNextCaption()
+            },
+            {
+                runOnUiThread {
+                    subtitle.text = text
+                    status.text = "تعذرت الترجمة، يظهر النص الأصلي"
+                }
+                translating = false
+                processNextCaption()
+            }
+        )
+    }
+
     inner class CaptionBridge {
         @JavascriptInterface
         fun onCaption(text: String) {
             val clean = text.replace(Regex("\\s+"), " ").trim()
             if (clean.isBlank()) return
             val now = System.currentTimeMillis()
-            if (clean == lastCaption && now - lastCaptionAt < 1500) return
+            if (clean == lastCaption && now - lastCaptionAt < 1200) return
             lastCaption = clean
             lastCaptionAt = now
             runOnUiThread { status.text = "تم التقاط النص — جاري الترجمة…" }
-            translator.translateToArabic(
-                clean,
-                { arabic ->
-                    runOnUiThread {
-                        subtitle.text = arabic.ifBlank { clean }
-                        status.text = "الترجمة تعمل"
-                    }
-                },
-                {
-                    runOnUiThread {
-                        subtitle.text = clean
-                        status.text = "تعذرت الترجمة، يظهر النص الأصلي"
-                    }
-                }
-            )
+            enqueueCaption(clean)
         }
     }
 
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
+        pendingCaption = null
         webView.removeJavascriptInterface("AqaabCaption")
         webView.stopLoading()
         webView.destroy()
@@ -220,21 +239,15 @@ class YouTubePlayerActivity : Activity() {
     }
 
     companion object {
+        private val HINDI_REGEX = Regex("[\\u0900-\\u097F]")
         private const val MOBILE_CHROME_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 16; Mobile) AppleWebKit/537.36 " +
                 "(KHTML, like Gecko) Chrome/132.0.0.0 Mobile Safari/537.36"
-
         private const val CAPTION_SCRIPT = """
             (function(){
               try {
                 function emit(){
-                  var selectors=[
-                    '.ytp-caption-segment',
-                    '.caption-window',
-                    '.ytp-caption-window-container',
-                    '.ytp-caption-window-bottom',
-                    '[class*="caption-segment"]'
-                  ];
+                  var selectors=['.ytp-caption-segment','.caption-window','.ytp-caption-window-container','.ytp-caption-window-bottom','[class*=\"caption-segment\"]'];
                   var parts=[];
                   selectors.forEach(function(sel){
                     document.querySelectorAll(sel).forEach(function(n){
@@ -247,12 +260,10 @@ class YouTubePlayerActivity : Activity() {
                 }
                 emit();
                 if(!window.__aqaabCaptionObserver){
-                  window.__aqaabCaptionObserver=new MutationObserver(function(){ emit(); });
-                  if(document.documentElement){
-                    window.__aqaabCaptionObserver.observe(document.documentElement,{subtree:true,childList:true,characterData:true});
-                  }
+                  window.__aqaabCaptionObserver=new MutationObserver(function(){emit();});
+                  if(document.documentElement) window.__aqaabCaptionObserver.observe(document.documentElement,{subtree:true,childList:true,characterData:true});
                 }
-              } catch(e) {}
+              }catch(e){}
             })();
         """
     }
