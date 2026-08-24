@@ -7,30 +7,30 @@ import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
-/** Fast on-device language identification + Arabic translation with model reuse. */
+/**
+ * Reusable on-device translator. Models are prepared once per language and reused.
+ * The caller may provide a source-language hint to avoid Language ID latency.
+ */
 class LocalTranslator {
     private val identifier = LanguageIdentification.getClient()
     private val translators = ConcurrentHashMap<String, Translator>()
-    private val ready = ConcurrentHashMap.newKeySet<String>()
+    private val prepared = ConcurrentHashMap<String, AtomicBoolean>()
 
-    fun prepare(sourceTag: String, onReady: () -> Unit = {}, onError: (Throwable) -> Unit = {}) {
+    fun prepare(sourceTag: String, onReady: () -> Unit, onError: (Throwable) -> Unit) {
         val source = TranslateLanguage.fromLanguageTag(sourceTag) ?: run {
-            onError(IllegalArgumentException("Unsupported language: $sourceTag"))
-            return
-        }
-        if (source == TranslateLanguage.ARABIC) {
-            onReady()
+            onError(IllegalArgumentException("Unsupported source language: $sourceTag"))
             return
         }
         val translator = getTranslator(source)
-        if (ready.contains(source)) {
+        if (prepared[source]!!.get()) {
             onReady()
             return
         }
         translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
             .addOnSuccessListener {
-                ready.add(source)
+                prepared[source]!!.set(true)
                 onReady()
             }
             .addOnFailureListener(onError)
@@ -38,71 +38,67 @@ class LocalTranslator {
 
     fun translateToArabic(
         text: String,
-        hintedSourceTag: String? = null,
+        sourceHint: String? = null,
         onResult: (String) -> Unit,
         onError: (Throwable) -> Unit
     ) {
         if (text.isBlank()) return
-
-        val hinted = hintedSourceTag?.let { TranslateLanguage.fromLanguageTag(it) }
-        if (hinted == TranslateLanguage.ARABIC) {
+        val hint = sourceHint?.let { TranslateLanguage.fromLanguageTag(it) }
+        if (hint == TranslateLanguage.ARABIC) {
             onResult(text)
             return
         }
-
-        if (hinted != null) {
-            translateWithSource(text, hinted, onResult, onError)
+        if (hint != null) {
+            translateWith(hint, text, onResult, onError)
             return
         }
-
         identifier.identifyLanguage(text)
             .addOnSuccessListener { tag ->
                 val source = TranslateLanguage.fromLanguageTag(tag)
                 if (source == null || source == TranslateLanguage.ARABIC) {
                     onResult(text)
                 } else {
-                    translateWithSource(text, source, onResult, onError)
+                    translateWith(source, text, onResult, onError)
                 }
             }
             .addOnFailureListener(onError)
     }
 
-    private fun translateWithSource(
-        text: String,
+    private fun translateWith(
         source: String,
+        text: String,
         onResult: (String) -> Unit,
         onError: (Throwable) -> Unit
     ) {
         val translator = getTranslator(source)
-        if (ready.contains(source)) {
-            translator.translate(text)
-                .addOnSuccessListener(onResult)
-                .addOnFailureListener(onError)
+        if (prepared[source]!!.get()) {
+            translator.translate(text).addOnSuccessListener(onResult).addOnFailureListener(onError)
             return
         }
         translator.downloadModelIfNeeded(DownloadConditions.Builder().build())
             .addOnSuccessListener {
-                ready.add(source)
-                translator.translate(text)
-                    .addOnSuccessListener(onResult)
-                    .addOnFailureListener(onError)
+                prepared[source]!!.set(true)
+                translator.translate(text).addOnSuccessListener(onResult).addOnFailureListener(onError)
             }
             .addOnFailureListener(onError)
     }
 
-    private fun getTranslator(source: String): Translator = translators.getOrPut(source) {
-        Translation.getClient(
-            TranslatorOptions.Builder()
-                .setSourceLanguage(source)
-                .setTargetLanguage(TranslateLanguage.ARABIC)
-                .build()
-        )
+    private fun getTranslator(source: String): Translator {
+        prepared.putIfAbsent(source, AtomicBoolean(false))
+        return translators.getOrPut(source) {
+            Translation.getClient(
+                TranslatorOptions.Builder()
+                    .setSourceLanguage(source)
+                    .setTargetLanguage(TranslateLanguage.ARABIC)
+                    .build()
+            )
+        }
     }
 
     fun close() {
         identifier.close()
         translators.values.forEach { it.close() }
         translators.clear()
-        ready.clear()
+        prepared.clear()
     }
 }
