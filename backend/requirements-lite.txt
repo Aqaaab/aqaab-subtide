@@ -1,0 +1,15 @@
+# Aqaab Subtide Lite - 4GB RAM desktop profile
+flask
+flask-cors
+flask-socketio
+flask-limiter
+python-dotenv
+requests
+numpy
+soundfile
+yt-dlp
+langdetect
+pydantic
+tqdm
+openai>=2.15.0
+openai-whisper
