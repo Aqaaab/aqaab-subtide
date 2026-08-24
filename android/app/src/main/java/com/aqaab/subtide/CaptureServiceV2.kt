@@ -1,0 +1,84 @@
+package com.aqaab.subtide
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Intent
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
+import android.os.Build
+import android.os.IBinder
+import android.view.Gravity
+import android.view.WindowManager
+import android.widget.TextView
+
+class CaptureServiceV2 : Service() {
+    private var projection: MediaProjection? = null
+    private var recorder: AudioRecord? = null
+    private var worker: Thread? = null
+    private var overlay: TextView? = null
+    private var windowManager: WindowManager? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val resultCode = intent?.getIntExtra("resultCode", 0) ?: return START_NOT_STICKY
+        val data = intent.getParcelableExtra<Intent>("data") ?: return START_NOT_STICKY
+        createNotificationChannel()
+        startForeground(10, notification())
+        val manager = getSystemService(MediaProjectionManager::class.java)
+        projection = manager.getMediaProjection(resultCode, data) ?: return START_NOT_STICKY
+        showOverlay("Aqaab: جاري التقاط صوت YouTube…")
+        if (Build.VERSION.SDK_INT >= 29) {
+            val config = AudioPlaybackCaptureConfiguration.Builder(projection!!).addMatchingUsage(AudioAttributes.USAGE_MEDIA).build()
+            val format = AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(16000).setChannelMask(AudioFormat.CHANNEL_IN_MONO).build()
+            val min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+            recorder = AudioRecord.Builder().setAudioFormat(format).setBufferSizeInBytes(min.coerceAtLeast(4096) * 2).setAudioPlaybackCaptureConfig(config).build()
+            recorder?.startRecording()
+            worker = Thread { readAudioBounded() }.also { it.start() }
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun readAudioBounded() {
+        val buffer = ShortArray(4096)
+        var samples = 0L
+        while (!Thread.currentThread().isInterrupted && recorder?.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+            val n = recorder?.read(buffer, 0, buffer.size) ?: 0
+            if (n > 0) samples += n
+            if (samples >= 16000L * 8L) { samples = 0; showOverlay("Aqaab: معالجة المقطع…") }
+        }
+    }
+
+    private fun showOverlay(text: String) {
+        if (windowManager == null) windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        val view = overlay ?: TextView(this).also {
+            it.textSize = 18f
+            it.setTextColor(0xFFFFFFFF.toInt())
+            it.setBackgroundColor(0xCC000000.toInt())
+            it.setPadding(24, 12, 24, 12)
+            overlay = it
+            val type = if (Build.VERSION.SDK_INT >= 26) WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY else WindowManager.LayoutParams.TYPE_PHONE
+            val params = WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, type, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE, android.graphics.PixelFormat.TRANSLUCENT)
+            params.gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            params.y = 140
+            windowManager?.addView(it, params)
+        }
+        overlay?.post { overlay?.text = text }
+    }
+
+    private fun createNotificationChannel() { getSystemService(NotificationManager::class.java).createNotificationChannel(NotificationChannel("translation", "Aqaab translation", NotificationManager.IMPORTANCE_LOW)) }
+    private fun notification(): Notification = Notification.Builder(this, "translation").setContentTitle("Aqaab Subtide").setContentText("جلسة ترجمة YouTube قيد التشغيل").setSmallIcon(android.R.drawable.ic_media_play).setOngoing(true).build()
+
+    override fun onDestroy() {
+        worker?.interrupt(); worker = null
+        recorder?.runCatching { stop() }; recorder?.release(); recorder = null
+        projection?.stop(); projection = null
+        overlay?.let { runCatching { windowManager?.removeView(it) } }; overlay = null
+        super.onDestroy()
+    }
+    override fun onBind(intent: Intent?): IBinder? = null
+}
